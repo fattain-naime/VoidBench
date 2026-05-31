@@ -422,7 +422,7 @@ git push origin feature/my-improvement
 
 ## 📜 Changelog
 
-### v2.0.0 (current)
+### v2.2.0 (current)
 - Full rewrite with modular architecture
 - `--json` output for automation/monitoring pipelines
 - fio random I/O with JSON parsing (IOPS + latency)
