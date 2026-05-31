@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  VoidBench  ·  v2.0.0  ·  Lab_0x4E Edition
+#  VoidBench  ·  v2.1.0  ·  Lab_0x4E Edition
 #  Author  : Fattain Naime  ·  https://iamnaime.info.bd
 #  Lab     : Lab_0x4E — Deciphering the Void
 #  GitHub  : https://github.com/fattain-naime/voidbench
@@ -33,7 +33,7 @@
 set -uo pipefail
 
 # ─── GLOBAL CONFIGURATION ─────────────────────────────────────────────────
-readonly BENCH_VERSION="2.0.0"
+readonly BENCH_VERSION="2.1.0"
 readonly BENCH_START_TS=$(date +%s)
 BENCH_DATE=$(date "+%Y-%m-%d %H:%M:%S %Z")
 REPORT_STEM="bench_$(hostname -s 2>/dev/null || echo vps)_$(date +%Y%m%d_%H%M%S)"
@@ -598,20 +598,30 @@ bench_memory() {
         sb_ver=$(sysbench --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
         awk "BEGIN{exit !(\"$sb_ver\"+0 >= 1.0)}" 2>/dev/null && sb_new=1
 
+        # Parse sysbench memory output:
+        # v1.x line → "102400.00 MiB transferred (27745.69 MiB/sec)"
+        # v0.4x line → "3264.00 MB transferred (108864.31 MB/sec)"
+        # Strip parens, then find the field ending in /sec and print the one before it.
+        _sb_mem_bw() {
+            awk '/transferred/{
+                gsub(/[()]/,"")
+                for(i=1;i<=NF;i++)
+                    if($i ~ /\/sec$/) { printf "%.2f", $(i-1); exit }
+            }'
+        }
+
         run_sb_mem() {
             local oper="$1"
             if [[ $sb_new -eq 1 ]]; then
                 sysbench memory \
                     --memory-total-size=8G \
                     --memory-oper="$oper" \
-                    --threads="$(nproc)" run 2>/dev/null | \
-                grep "transferred" | grep -oP '[\d.]+(?= MiB)'
+                    --threads="$(nproc)" run 2>/dev/null | _sb_mem_bw
             else
                 sysbench --test=memory \
                     --memory-total-size=8G \
                     --memory-oper="$oper" \
-                    --num-threads="$(nproc)" run 2>/dev/null | \
-                grep "transferred" | grep -oP '[\d.]+(?= MiB)'
+                    --num-threads="$(nproc)" run 2>/dev/null | _sb_mem_bw
             fi
         }
 
@@ -623,15 +633,23 @@ bench_memory() {
         local mem_rd
         mem_rd=$(run_sb_mem read)
 
-        kv "Write Bandwidth" "${mem_wr:-N/A} MiB/s"
-        kv "Read Bandwidth"  "${mem_rd:-N/A} MiB/s"
+        # Convert MiB/s to GiB/s for display
+        local wr_gibs rd_gibs
+        wr_gibs=$(awk_calc "${mem_wr:-0} / 1024")
+        rd_gibs=$(awk_calc "${mem_rd:-0} / 1024")
+
+        kv "Write Bandwidth" "${mem_wr:-N/A} MiB/s  (${wr_gibs} GiB/s)"
+        kv "Read  Bandwidth" "${mem_rd:-N/A} MiB/s  (${rd_gibs} GiB/s)"
 
         R[mem_write_bw]="${mem_wr:-0}"
         R[mem_read_bw]="${mem_rd:-0}"
 
-        # Score: 20 GiB/s = 100
+        # Score baseline: 40 GiB/s = 100 pts  (DDR5-4800 dual-channel reference)
+        #   DDR3 ~ 8-12  GiB/s  →  20-30 pts
+        #   DDR4 ~15-25  GiB/s  →  37-62 pts
+        #   DDR5 ~25-55  GiB/s  →  62-100 pts
         if [[ -n "$mem_rd" ]] && awk "BEGIN{exit !($mem_rd > 0)}" 2>/dev/null; then
-            mem_score=$(awk_clamp "$mem_rd / 204.8" 5 100)
+            mem_score=$(awk_clamp "$mem_rd / 409.6" 5 100)
         fi
     else
         section "dd-based Memory Bandwidth (/dev/shm)" "💾"
