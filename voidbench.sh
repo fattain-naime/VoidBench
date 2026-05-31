@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  VoidBench  ·  v2.1.0  ·  Lab_0x4E Edition
+#  VoidBench  ·  v2.2.0  ·  Lab_0x4E Edition
 #  Author  : Fattain Naime  ·  https://iamnaime.info.bd
 #  Lab     : Lab_0x4E — Deciphering the Void
 #  GitHub  : https://github.com/fattain-naime/voidbench
@@ -33,7 +33,7 @@
 set -uo pipefail
 
 # ─── GLOBAL CONFIGURATION ─────────────────────────────────────────────────
-readonly BENCH_VERSION="2.1.0"
+readonly BENCH_VERSION="2.2.0"
 readonly BENCH_START_TS=$(date +%s)
 BENCH_DATE=$(date "+%Y-%m-%d %H:%M:%S %Z")
 REPORT_STEM="bench_$(hostname -s 2>/dev/null || echo vps)_$(date +%Y%m%d_%H%M%S)"
@@ -572,9 +572,31 @@ print(f'{elapsed:.4f} {count}')
     section "Multi-thread Integer Compute" "🧮"
     echo -e "  ${DIM_}Parallel SHA-256 hashing ($(nproc) threads, 5s)...${RST_}"
     local hash_result
-    hash_result=$(openssl speed -elapsed -seconds 5 -multi "$(nproc)" sha256 2>/dev/null | \
-                  grep "sha256" | awk '{v=$NF; gsub(/k/,"",v); printf "%.1f", v/1024}')
-    kv "Parallel SHA-256" "${hash_result:-N/A} MB/s"
+    hash_result=$(python3 - <<'PYEOF' 2>/dev/null
+import hashlib, threading, time
+
+DURATION = 5
+BLOCK    = 65536          # 64 KiB per hash
+data     = b'x' * BLOCK
+n        = __import__('os').cpu_count() or 1
+results  = [0] * n
+
+def worker(idx):
+    end = time.perf_counter() + DURATION
+    count = 0
+    while time.perf_counter() < end:
+        hashlib.sha256(data).digest()
+        count += 1
+    results[idx] = count * BLOCK
+
+threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+[t.start() for t in threads]
+[t.join()  for t in threads]
+total_mb = sum(results) / 1024 / 1024
+print(f"{total_mb / DURATION:.1f}")
+PYEOF
+)
+    kv "Parallel SHA-256 ($(nproc)T)" "${hash_result:-N/A} MB/s"
 
     [[ $throttled -eq 1 ]] && cpu_score=$(awk_clamp "$cpu_score * 0.85" 0 100)
     S[cpu]=$cpu_score
@@ -773,17 +795,20 @@ bench_disk() {
     R[disk_seq_rd]="${avg_rd}"
 
     # ── Sync / fsync latency ──
-    section "Sync Write Latency  (4K blocks, oflag=sync)" "⏱"
-    local sync_spd
-    sync_spd=$(dd if=/dev/zero of="${DISK_TESTFILE}_sync" \
-                  bs=4k count=512 oflag=sync 2>&1 | \
-               awk '/copied/{
-                   for(i=1;i<=NF;i++) if($i~/[MG]B\/s/){
-                       v=$(i-1); if($i~/G/) printf "%.1f GB/s", v
-                       else printf "%.1f MB/s", v; exit
-                   }
-               }')
-    kv "4K Sync Write" "${sync_spd:-N/A}"
+    section "Sync Write Latency  (4K blocks, oflag=sync, 64 MiB)" "⏱"
+    local sync_out sync_mbps
+    sync_out=$(dd if=/dev/zero of="${DISK_TESTFILE}_sync" \
+                  bs=4k count=16384 oflag=sync 2>&1)
+    sync_mbps=$(dd_to_mbps "$sync_out")
+    if [[ -n "$sync_mbps" ]]; then
+        if awk "BEGIN{exit !($sync_mbps >= 1000)}" 2>/dev/null; then
+            kv "4K Sync Write" "$(awk_calc "$sync_mbps / 1024") GB/s"
+        else
+            kv "4K Sync Write" "${sync_mbps} MB/s"
+        fi
+    else
+        kv "4K Sync Write" "N/A"
+    fi
     rm -f "${DISK_TESTFILE}_sync"
 
     # ── fio random I/O ──
@@ -792,7 +817,7 @@ bench_disk() {
 
         fio_run() {
             local label="$1" rw="$2" extra="${3:-}"
-            echo -e "  ${DIM_}${label}...${RST_}"
+            echo -e "  ${DIM_}${label}...${RST_}" >&2
             local out
             out=$(fio \
                 --name="vbench_${rw}" \
@@ -930,15 +955,18 @@ print(f\"{d.get('city','?')}, {d.get('regionName','?')}, {d.get('country','?')} 
         fi
     done
 
-    # Regional latency
+    # Regional latency — using geographically anchored IPs (IXP / national NOCs)
+    # NOT anycast (Cloudflare/Google/Quad9 respond from nearest PoP, not the labelled city)
     section "Regional Latency" "🗺"
     declare -A REGIONAL=(
-        ["Tokyo, JP"]="8.8.4.4"
-        ["Singapore, SG"]="103.86.96.100"
-        ["London, UK"]="185.228.168.9"
-        ["Frankfurt, DE"]="9.9.9.10"
-        ["São Paulo, BR"]="200.160.0.1"
-        ["Sydney, AU"]="1.0.0.1"
+        ["Tokyo (JP)"]="210.171.224.1"      # JPIX Tokyo
+        ["Singapore (SG)"]="202.12.28.1"    # APNIC Singapore
+        ["London (UK)"]="195.66.226.11"     # LINX London
+        ["Frankfurt (DE)"]="80.81.194.2"    # DE-CIX Frankfurt
+        ["São Paulo (BR)"]="200.219.141.10" # PTT São Paulo
+        ["Sydney (AU)"]="203.12.160.35"     # AARNet Sydney
+        ["New York (US)"]="198.32.160.26"   # NYIIX New York
+        ["Los Angeles (US)"]="206.197.187.10" # LAIIX Los Angeles
     )
     for region in "${!REGIONAL[@]}"; do
         local host="${REGIONAL[$region]}"
@@ -952,10 +980,10 @@ print(f\"{d.get('city','?')}, {d.get('regionName','?')}, {d.get('country','?')} 
     section "Download Speed Tests" "⬇"
 
     declare -A DL_SERVERS=(
-        ["Cloudflare (Global 100MB)"]="https://speed.cloudflare.com/__down?bytes=104857600"
+        ["Hetzner DE (100MB)"]="https://speed.hetzner.de/100MB.bin"
+        ["OVH BHS (100MB)"]="https://proof.ovh.net/files/100Mb.dat"
         ["Linode Tokyo (100MB)"]="https://speed.tokyo2.linode.com/100MB-tokyo2.bin"
         ["Linode Singapore (100MB)"]="https://speed.singapore.linode.com/100MB-singapore.bin"
-        ["DigitalOcean AMS (100MB)"]="https://speed.ams3.digitalocean.com/100mb.test"
         ["Vultr Paris (100MB)"]="https://par-fr-ping.vultr.com/vultr.com.100MB.bin"
     )
 
@@ -968,9 +996,10 @@ print(f\"{d.get('city','?')}, {d.get('regionName','?')}, {d.get('country','?')} 
                     --connect-timeout 8 --max-time 25 \
                     --retry 1 --retry-max-time 30 \
                     "$url" 2>/dev/null)
-        if [[ -n "$bytes_sec" ]] && awk "BEGIN{exit !($bytes_sec > 0)}" 2>/dev/null; then
-            local mbps
-            mbps=$(awk_calc "$bytes_sec * 8 / 1000000")
+        local mbps
+        mbps=$(awk_calc "${bytes_sec:-0} * 8 / 1000000")
+        # Require at least 0.5 Mbps to count as a valid result
+        if awk "BEGIN{exit !($mbps > 0.5)}" 2>/dev/null; then
             kv "  ${srv_name}" "${mbps} Mbps"
             dl_speeds+=("$mbps")
         else
@@ -999,7 +1028,7 @@ print(f\"{d.get('city','?')}, {d.get('regionName','?')}, {d.get('country','?')} 
             echo -e "  ${DIM_}Connecting to ${srv}:5201...${RST_}"
             local res
             res=$(timeout 35 iperf3 -c "$srv" -t 10 -P 4 2>/dev/null | \
-                  grep "SUM" | grep "sender\|receiver" | \
+                  grep "SUM" | grep "receiver" | \
                   awk '{printf "%s %s\n", $6, $7}')
             if [[ -n "$res" ]]; then
                 kv "  $srv" "$res"
@@ -1239,7 +1268,7 @@ print_banner() {
  ║    ╚████╔╝ ╚██████╔╝██║██████╔╝██████╔╝███████╗██║ ╚████║╚██████╗██║  ██║  ║
  ║     ╚═══╝   ╚═════╝ ╚═╝╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝  ║                                                                      ║                                                                       ║
  ╠════════════════════════════════════════════════════════════════════════════╣
- ║   Benchmark Suite v2.0.0  ·  Lab_0x4E Edition                              ║
+ ║   Benchmark Suite v2.2.0  ·  Lab_0x4E Edition                              ║
  ║   Author: Fattain Naime  |  https://iamnaime.info.bd                       ║
  ║   Tests: CPU · Memory · Disk I/O · Network · Crypto · Compression          ║
  ╚════════════════════════════════════════════════════════════════════v═══════╝
